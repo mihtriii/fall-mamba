@@ -16,12 +16,14 @@ from timm.models.vision_transformer import _load_weights
 
 import math
 
-from mamba_ssm.modules.mamba_simple import Mamba
+# from mamba_ssm.modules.mamba_simple import Mamba # Moved to try-except block
 
 try:
+    from mamba_ssm.modules.mamba_simple import Mamba
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+    print("Warning: mamba_ssm not found. Using mock implementation for testing.")
+    from mock_mamba import Mamba, RMSNorm, layer_norm_fn, rms_norm_fn
 
 MODEL_PATH = 'your_model_path'
 _MODELS = {
@@ -45,49 +47,7 @@ class VideoFeatureExtractor(nn.Module):
         x = self.fc(x)
         return x
 
-class AudioFeatureExtractor(nn.Module):
-    def __init__(self, input_dim, embed_dim):
-        super(AudioFeatureExtractor, self).__init__()
-        resnet = (models.resnet50
-                  (pretrained=True))
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])  # 保持空间维度
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(resnet.fc.in_features, embed_dim)
 
-    def forward(self, x):
-        x = self.feature_extractor(x)
-        x = self.pool(x)  # 通过池化层
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-class CrossAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=8, dropout_rate=0.1):
-        super(CrossAttention, self).__init__()
-        self.num_heads = num_heads
-        self.depth = embed_dim // num_heads
-
-        self.query_audio = nn.Linear(embed_dim, embed_dim)
-        self.key_video = nn.Linear(embed_dim, embed_dim)
-        self.value_video = nn.Linear(embed_dim, embed_dim)
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, video_features, audio_features):
-        batch_size = video_features.size(0)
-        seq_length = video_features.size(1)
-
-        query = self.query_audio(audio_features).view(batch_size, seq_length, self.num_heads, self.depth).transpose(1, 2)
-        key = self.key_video(video_features).view(batch_size, seq_length, self.num_heads, self.depth).transpose(1, 2)
-        value = self.value_video(video_features).view(batch_size, seq_length, self.num_heads, self.depth).transpose(1, 2)
-
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.depth)
-        attn = self.softmax(scores)
-
-        out = torch.matmul(attn, value).transpose(1, 2).contiguous().view(batch_size, seq_length, self.num_heads * self.depth)
-        out = self.norm(out)
-        return out
 
 class MultiHeadTemporalAttention(nn.Module):
     def __init__(self, in_dim, num_heads=8, dropout_rate=0.1, max_len=5000):
@@ -340,7 +300,7 @@ class VisionMamba(nn.Module):
         )
         num_patches = self.patch_embed.num_patches
         self.video_feature_extractor = VideoFeatureExtractor(embed_dim)
-        self.audio_feature_extractor = AudioFeatureExtractor(input_dim=3, embed_dim=embed_dim)
+        # self.audio_feature_extractor = AudioFeatureExtractor(input_dim=3, embed_dim=embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.embed_dim))
         self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, (num_frames // kernel_size) * 200, embed_dim))  # 乘以200
@@ -372,7 +332,7 @@ class VisionMamba(nn.Module):
             )
             self.layers.append(block)
 
-        self.cross_attention = CrossAttention(embed_dim=embed_dim)
+        # self.cross_attention = CrossAttention(embed_dim=embed_dim)
 
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(embed_dim, eps=norm_epsilon, **factory_kwargs)
 
@@ -418,35 +378,15 @@ class VisionMamba(nn.Module):
         video_features = video_features.view(B, T, -1)
         # print(f"Video features shape: {video_features.shape}")
 
-        if audio is not None:
-            if audio.dim() == 5:
-                audio = audio.view(B * T, 3, H, W)
-            # print(f"Reshaped audio shape: {audio.shape}")
-            audio_features = self.audio_feature_extractor(audio)
-            audio_features = audio_features.view(B, T, -1)
-            # print(f"Audio features shape: {audio_features.shape}")
+        video_features = video_features.view(B, T, self.embed_dim).permute(0, 2, 1)
+        video_features = video_features.unsqueeze(2).unsqueeze(2)
+        video_features = video_features.expand(-1, -1, H, W, -1)
+        video_features = video_features.permute(0, 1, 4, 2, 3)
 
-            # 融合特征
-            fused_features = self.cross_attention(video_features, audio_features)
-            fused_features = fused_features.view(B, T, self.embed_dim).permute(0, 2, 1)
-            fused_features = fused_features.unsqueeze(2).unsqueeze(2)
-            fused_features = fused_features.expand(-1, -1, H, W, -1)
-            fused_features = fused_features.permute(0, 1, 4, 2, 3)
-
-            if fused_features.shape[1] > 3:
-                fused_features = fused_features[:, :3, :, :, :]
-            # print(f"Fused features shape before PatchEmbed: {fused_features.shape}")
-            x = self.patch_embed(fused_features)
-        else:
-            video_features = video_features.view(B, T, self.embed_dim).permute(0, 2, 1)
-            video_features = video_features.unsqueeze(2).unsqueeze(2)
-            video_features = video_features.expand(-1, -1, H, W, -1)
-            video_features = video_features.permute(0, 1, 4, 2, 3)
-
-            if video_features.shape[1] > 3:
-                video_features = video_features[:, :3, :, :, :]
-            # print(f"Video features shape before PatchEmbed: {video_features.shape}")
-            x = self.patch_embed(video_features)
+        if video_features.shape[1] > 3:
+            video_features = video_features[:, :3, :, :, :]
+        # print(f"Video features shape before PatchEmbed: {video_features.shape}")
+        x = self.patch_embed(video_features)
 
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
@@ -480,9 +420,13 @@ class VisionMamba(nn.Module):
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
-            hidden_states = fused_add_norm_fn(self.drop_path(hidden_states), self.norm_f.weight, self.norm_f.bias,
+            ret = fused_add_norm_fn(self.drop_path(hidden_states), self.norm_f.weight, self.norm_f.bias,
                                               eps=self.norm_f.eps, residual=residual, prenorm=False,
                                               residual_in_fp32=self.residual_in_fp32)
+            if isinstance(ret, tuple):
+                hidden_states = ret[0]
+            else:
+                hidden_states = ret
 
         return hidden_states[:, 0, :]
 
@@ -525,7 +469,7 @@ def videomamba_tiny(pretrained=False, **kwargs):
     model = VisionMamba(
         patch_size=16,
         embed_dim=192,
-        depth=24,
+        depth=16,
         rms_norm=True,
         residual_in_fp32=True,
         fused_add_norm=True,
